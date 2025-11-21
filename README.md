@@ -93,10 +93,6 @@ huggingface-cli login
 # Accept terms at https://huggingface.co/facebook/sam3
 ```
 
-**Model specs**:
-- Size: ~850 MB
-- Parameters: 848M
-
 ---
 
 ## Documentation
