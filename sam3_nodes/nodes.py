@@ -8,6 +8,7 @@ import os
 import numpy as np
 from PIL import Image
 
+import folder_paths
 import comfy.model_management as mm
 
 # 预定义调色板 - 鲜明易区分的颜色 (RGB)
@@ -62,7 +63,7 @@ class DownloadAndLoadSAM3Model:
             raise ValueError("CPU只支持fp32精度，请选择fp32或切换到cuda")
 
         # 2. 设置路径
-        model_path = "/root/ComfyUI/models/sam3/sam3.pt"
+        model_path = os.path.join(folder_paths.models_dir, "sam3", "sam3.pt")
         bpe_path = os.path.join(
             os.path.dirname(script_directory),
             "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
