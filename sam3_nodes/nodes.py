@@ -595,12 +595,155 @@ class Sam3SegmentationOriginal:
         return (masks_comfy, masked_image)
 
 
+class Sam3SegmentationWithDetail:
+    """
+    SAM3 分割节点 + VITMatte 边缘细化
+    输出精细化的mask和mask区域的原图（黑底）
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam3_model": ("SAM3MODEL",),
+                "image": ("IMAGE",),
+                "text_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "自然语言描述，如'shoe', 'person', 'red car'"
+                }),
+                "keep_model_loaded": ("BOOLEAN", {"default": False}),
+                "detail_erode": ("INT", {"default": 6, "min": 1, "max": 255, "step": 1,
+                    "tooltip": "Trimap 腐蚀核大小，控制确定前景区域"}),
+                "detail_dilate": ("INT", {"default": 4, "min": 1, "max": 255, "step": 1,
+                    "tooltip": "Trimap 膨胀核大小，控制不确定区域宽度"}),
+                "black_point": ("FLOAT", {"default": 0.15, "min": 0.01, "max": 0.98, "step": 0.01,
+                    "display": "slider", "tooltip": "直方图重映射黑点，低于此值映射为0"}),
+                "white_point": ("FLOAT", {"default": 0.99, "min": 0.02, "max": 0.99, "step": 0.01,
+                    "display": "slider", "tooltip": "直方图重映射白点，高于此值映射为1"}),
+                "max_megapixels": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1,
+                    "tooltip": "VITMatte 最大处理像素数（百万），超过则降采样"}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "IMAGE")
+    RETURN_NAMES = ("mask", "image")
+    FUNCTION = "segment"
+    CATEGORY = "SAM3"
+
+    def segment(self, image, sam3_model, text_prompt, keep_model_loaded,
+                detail_erode, detail_dilate, black_point, white_point, max_megapixels):
+        """
+        执行SAM3分割 + VITMatte边缘细化
+
+        Returns:
+            mask: 精细化后的合并mask
+            image: mask区域的原图（黑底）
+        """
+        from .detail_utils import process_mask_with_vitmatte
+
+        processor = sam3_model["processor"]
+        device = sam3_model["device"]
+
+        B, H, W, C = image.shape
+
+        if B > 1:
+            print(f"⚠️  警告：当前只支持batch_size=1，将只处理第一张图片")
+
+        image_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
+        pil_image = Image.fromarray(image_np)
+        width, height = pil_image.size
+
+        print(f"Processing image: {width} x {height}")
+
+        inference_state = processor.set_image(pil_image)
+
+        if not text_prompt or not text_prompt.strip():
+            raise ValueError("必须提供text_prompt！例如：'person', 'shoe', 'car'")
+
+        prompts = [p.strip() for p in text_prompt.split(',') if p.strip()]
+        if not prompts:
+            raise ValueError("必须提供有效的text_prompt！")
+
+        print(f"Text prompts: {prompts} ({len(prompts)} prompts)")
+
+        all_masks = []
+        total_objects = 0
+
+        for i, prompt in enumerate(prompts):
+            processor.reset_all_prompts(inference_state)
+            inference_state = processor.set_text_prompt(
+                state=inference_state,
+                prompt=prompt
+            )
+
+            masks = inference_state["masks"]
+            scores = inference_state["scores"]
+
+            num_objects = len(masks)
+            total_objects += num_objects
+            print(f"  [{i+1}/{len(prompts)}] '{prompt}': {num_objects} objects")
+
+            if num_objects > 0:
+                print(f"    Scores: {scores.cpu().float().numpy()}")
+                all_masks.append(masks)
+
+        print(f"✓ Total detected: {total_objects} objects")
+
+        if all_masks:
+            combined_masks = torch.cat(all_masks, dim=0)
+            masks_squeezed = combined_masks.squeeze(1)
+            merged_mask = torch.any(masks_squeezed, dim=0, keepdim=True)
+            masks_comfy = merged_mask.cpu().float()
+        else:
+            masks_comfy = torch.zeros((1, H, W), dtype=torch.float32)
+
+        print(f"✓ SAM3 mask shape: {masks_comfy.shape}")
+
+        # ===== VITMatte 边缘细化 =====
+        print(f"Processing VITMatte detail refinement...")
+        print(f"  detail_erode={detail_erode}, detail_dilate={detail_dilate}")
+        print(f"  black_point={black_point}, white_point={white_point}")
+        print(f"  max_megapixels={max_megapixels}")
+
+        refined_mask_pil = process_mask_with_vitmatte(
+            image=pil_image,
+            mask=masks_comfy,
+            detail_erode=detail_erode,
+            detail_dilate=detail_dilate,
+            black_point=black_point,
+            white_point=white_point,
+            device=device,
+            max_megapixels=max_megapixels
+        )
+
+        # 转回 tensor
+        refined_mask_np = np.array(refined_mask_pil).astype(np.float32) / 255.0
+        masks_comfy = torch.from_numpy(refined_mask_np).unsqueeze(0)
+
+        print(f"✓ Refined mask shape: {masks_comfy.shape}")
+
+        # 生成masked image（黑底）
+        mask_expanded = masks_comfy.unsqueeze(-1)
+        masked_image = image[0:1] * mask_expanded
+
+        print(f"✓ Output image shape: {masked_image.shape}")
+
+        if not keep_model_loaded:
+            processor.reset_all_prompts(inference_state)
+            inference_state.clear()
+            mm.soft_empty_cache()
+
+        return (masks_comfy, masked_image)
+
+
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadSAM3Model": DownloadAndLoadSAM3Model,
     "Sam3SegmentationByIndex": Sam3Segmentation,
     "Sam3SegmentationByFace": Sam3SegmentationByFace,
     "Sam3SegmentationOriginal": Sam3SegmentationOriginal,
+    "Sam3SegmentationWithDetail": Sam3SegmentationWithDetail,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -608,4 +751,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Sam3SegmentationByIndex": "SAM3 Segmentation By Index",
     "Sam3SegmentationByFace": "SAM3 Segmentation By Face",
     "Sam3SegmentationOriginal": "SAM3 Segmentation Original",
+    "Sam3SegmentationWithDetail": "SAM3 Segmentation With Detail",
 }
